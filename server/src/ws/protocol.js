@@ -3,11 +3,10 @@ export const TYPES = {
   SEND: "send",
   TYPING: "typing",
 
-  JOINED: "joined",
-  HISTORY: "history",
+  READY: "ready",
   MESSAGE: "message",
   PRESENCE: "presence",
-  ERROR: "error"
+  ERROR: "error",
 };
 
 export function safeJsonParse(raw) {

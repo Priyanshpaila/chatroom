@@ -1,48 +1,46 @@
 import { sendJson, TYPES } from "./protocol.js";
 
-const roomMembers = new Map(); // roomId -> Set(ws)
+const roomSockets = new Map(); // roomId -> Set(ws)
 
-export function joinRoom(ws, roomId) {
-  leaveRoom(ws);
+export function joinRoomSocket(ws, roomId) {
+  leaveRoomSocket(ws);
 
   ws._roomId = roomId;
-
-  if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Set());
-  roomMembers.get(roomId).add(ws);
-
+  if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Set());
+  roomSockets.get(roomId).add(ws);
   broadcastPresence(roomId);
 }
 
-export function leaveRoom(ws) {
+export function leaveRoomSocket(ws) {
   const roomId = ws._roomId;
   if (!roomId) return;
 
-  const set = roomMembers.get(roomId);
+  const set = roomSockets.get(roomId);
   if (set) {
     set.delete(ws);
-    if (set.size === 0) roomMembers.delete(roomId);
+    if (set.size === 0) roomSockets.delete(roomId);
   }
-
   ws._roomId = null;
 
   broadcastPresence(roomId);
 }
 
-export function broadcastToRoom(roomId, payload) {
-  const set = roomMembers.get(roomId);
+export function broadcastToRoom(roomId, payload, { excludeWs } = {}) {
+  const set = roomSockets.get(roomId);
   if (!set) return;
 
   for (const client of set) {
+    if (excludeWs && client === excludeWs) continue;
     sendJson(client, payload);
   }
 }
 
 export function broadcastPresence(roomId) {
-  const set = roomMembers.get(roomId);
+  const set = roomSockets.get(roomId);
   const online = set
     ? Array.from(set)
         .filter((w) => w._user)
-        .map((w) => ({ name: w._user.name }))
+        .map((w) => ({ id: w._user.id, name: w._user.name }))
     : [];
 
   broadcastToRoom(roomId, { type: TYPES.PRESENCE, roomId, online });

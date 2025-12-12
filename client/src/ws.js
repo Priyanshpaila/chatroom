@@ -1,10 +1,11 @@
-export function createChatSocket({ url, onEvent }) {
+export function createWsClient({ url, token, onEvent }) {
   let ws = null;
   let closedByUser = false;
   let retry = 0;
 
   function connect() {
-    ws = new WebSocket(url);
+    const fullUrl = `${url}?token=${encodeURIComponent(token)}`;
+    ws = new WebSocket(fullUrl);
 
     ws.onopen = () => {
       retry = 0;
@@ -16,17 +17,16 @@ export function createChatSocket({ url, onEvent }) {
         const data = JSON.parse(e.data);
         onEvent(data);
       } catch {
-        // ignore invalid
+        // ignore
       }
     };
 
     ws.onclose = () => {
       onEvent({ type: "__close" });
-
       if (closedByUser) return;
 
       retry += 1;
-      const delay = Math.min(5000, 500 * retry);
+      const delay = Math.min(6000, 500 * retry);
       setTimeout(connect, delay);
     };
 
@@ -46,6 +46,6 @@ export function createChatSocket({ url, onEvent }) {
     close() {
       closedByUser = true;
       try { ws.close(); } catch {}
-    }
+    },
   };
 }

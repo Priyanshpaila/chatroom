@@ -3,10 +3,22 @@ import express from "express";
 import cors from "cors";
 import http from "http";
 import { WebSocketServer } from "ws";
+import mongoose from "mongoose";
+
 import { connectDb } from "./db.js";
-import { Message } from "./models/Message.js";
+import { requireAuth } from "./auth/middleware.js";
+import { verifyToken } from "./auth/jwt.js";
+
 import { TYPES, safeJsonParse, sendJson } from "./ws/protocol.js";
-import { joinRoom, leaveRoom, broadcastToRoom } from "./ws/rooms.js";
+import { joinRoomSocket, leaveRoomSocket, broadcastToRoom } from "./ws/rooms.js";
+
+import { authRouter } from "./routes/auth.js";
+import { meRouter } from "./routes/me.js";
+import { usersRouter } from "./routes/users.js";
+import { roomsRouter } from "./routes/rooms.js";
+
+import { RoomMember } from "./models/RoomMember.js";
+import { Message } from "./models/Message.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
@@ -19,8 +31,14 @@ app.use(express.json());
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+app.use("/api/auth", authRouter);
+app.use("/api/me", requireAuth, meRouter);
+app.use("/api/users", requireAuth, usersRouter);
+app.use("/api/rooms", requireAuth, roomsRouter);
+
 const server = http.createServer(app);
 
+// --- WebSocket server ---
 const wss = new WebSocketServer({ server, path: WS_PATH });
 
 // Heartbeat
@@ -28,104 +46,100 @@ function heartbeat() {
   this.isAlive = true;
 }
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
 
-  // MVP identity: `name` from query string
+  // Auth via token query param: ws://host/ws?token=...
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const name = (url.searchParams.get("name") || "guest").slice(0, 32);
+  const token = String(url.searchParams.get("token") || "");
 
-  ws._user = { name };
+  let user = null;
+  try {
+    const payload = verifyToken(token);
+    user = { id: String(payload.sub), name: payload.name, email: payload.email };
+  } catch {
+    sendJson(ws, { type: TYPES.ERROR, message: "Unauthorized (invalid token)" });
+    ws.close();
+    return;
+  }
+
+  ws._user = user;
   ws._roomId = null;
 
-  sendJson(ws, { type: TYPES.JOINED, user: { name } });
+  sendJson(ws, { type: TYPES.READY, user });
 
   ws.on("message", async (raw) => {
     const msg = safeJsonParse(raw.toString());
     if (!msg || !msg.type) {
-      return sendJson(ws, { type: TYPES.ERROR, message: "Invalid JSON message" });
+      return sendJson(ws, { type: TYPES.ERROR, message: "Invalid JSON" });
     }
 
     try {
       if (msg.type === TYPES.JOIN) {
         const roomId = String(msg.roomId || "").trim();
-        if (!roomId) {
-          return sendJson(ws, { type: TYPES.ERROR, message: "roomId required" });
-        }
+        if (!roomId) return sendJson(ws, { type: TYPES.ERROR, message: "roomId required" });
 
-        joinRoom(ws, roomId);
-
-        // Send history (oldest -> newest)
-        const history = await Message.find({ roomId })
-          .sort({ createdAt: -1 })
-          .limit(HISTORY_LIMIT)
-          .lean();
-
-        history.reverse();
-
-        return sendJson(ws, {
-          type: TYPES.HISTORY,
-          roomId,
-          messages: history.map((m) => ({
-            id: String(m._id),
-            roomId: m.roomId,
-            sender: m.sender,
-            text: m.text,
-            createdAt: m.createdAt
-          }))
+        // membership check
+        const isMember = await RoomMember.exists({
+          roomId: new mongoose.Types.ObjectId(roomId),
+          userId: new mongoose.Types.ObjectId(user.id),
         });
+
+        if (!isMember) return sendJson(ws, { type: TYPES.ERROR, message: "Not a member of this room" });
+
+        joinRoomSocket(ws, roomId);
+        return;
       }
 
       if (msg.type === TYPES.SEND) {
         const roomId = ws._roomId;
-        if (!roomId) {
-          return sendJson(ws, { type: TYPES.ERROR, message: "Join a room first" });
-        }
+        if (!roomId) return sendJson(ws, { type: TYPES.ERROR, message: "Join a room first" });
 
         const text = String(msg.text || "").trim();
         if (!text) return;
+        if (text.length > 2000) return sendJson(ws, { type: TYPES.ERROR, message: "Message too long" });
 
-        if (text.length > 2000) {
-          return sendJson(ws, { type: TYPES.ERROR, message: "Message too long" });
-        }
+        // Ensure membership still valid
+        const isMember = await RoomMember.exists({
+          roomId: new mongoose.Types.ObjectId(roomId),
+          userId: new mongoose.Types.ObjectId(user.id),
+        });
+        if (!isMember) return sendJson(ws, { type: TYPES.ERROR, message: "Not a member of this room" });
 
         const created = await Message.create({
-          roomId,
-          sender: ws._user.name,
-          text
+          roomId: new mongoose.Types.ObjectId(roomId),
+          senderId: new mongoose.Types.ObjectId(user.id),
+          senderName: user.name,
+          text,
         });
 
-        const payload = {
+        broadcastToRoom(roomId, {
           type: TYPES.MESSAGE,
           message: {
             id: String(created._id),
             roomId,
-            sender: created.sender,
+            senderId: String(created.senderId),
+            senderName: created.senderName,
             text: created.text,
-            createdAt: created.createdAt
-          }
-        };
-
-        broadcastToRoom(roomId, payload);
+            createdAt: created.createdAt,
+          },
+        });
         return;
       }
 
       if (msg.type === TYPES.TYPING) {
         const roomId = ws._roomId;
         if (!roomId) return;
-
-        const isTyping = !!msg.isTyping;
-        broadcastToRoom(roomId, {
-          type: TYPES.TYPING,
+        broadcastToRoom(
           roomId,
-          name: ws._user.name,
-          isTyping
-        });
+          { type: TYPES.TYPING, roomId, name: user.name, isTyping: !!msg.isTyping },
+          { excludeWs: ws }
+        );
         return;
       }
 
-      return sendJson(ws, { type: TYPES.ERROR, message: "Unknown message type" });
+      return sendJson(ws, { type: TYPES.ERROR, message: "Unknown type" });
     } catch (e) {
       console.error(e);
       return sendJson(ws, { type: TYPES.ERROR, message: "Server error" });
@@ -133,7 +147,7 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    leaveRoom(ws);
+    leaveRoomSocket(ws);
   });
 });
 
@@ -148,9 +162,26 @@ const interval = setInterval(() => {
 
 wss.on("close", () => clearInterval(interval));
 
-await connectDb(process.env.MONGODB_URI);
+// --- Message TTL (optional) ---
+async function ensureMessageTTL() {
+  const days = Number(process.env.MESSAGE_TTL_DAYS || "");
+  if (!days || days <= 0) return;
 
-server.listen(PORT, () => {
+  const seconds = Math.floor(days * 24 * 60 * 60);
+  try {
+    await Message.collection.createIndex({ createdAt: 1 }, { expireAfterSeconds: seconds });
+    console.log(`TTL enabled: messages expire after ${days} day(s)`);
+  } catch (e) {
+    console.warn("Failed to create TTL index:", e?.message || e);
+  }
+}
+
+// Start server
+await connectDb(process.env.MONGODB_URI);
+await ensureMessageTTL();
+
+server.listen(PORT,  () => {
   console.log(`HTTP: http://localhost:${PORT}`);
   console.log(`WS: ws://localhost:${PORT}${WS_PATH}`);
+  console.log(`CORS origin: ${CLIENT_ORIGIN}`);
 });
