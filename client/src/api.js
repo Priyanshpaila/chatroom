@@ -39,9 +39,28 @@ export const api = {
   login: (payload) => request("/api/auth/login", { method: "POST", body: payload, auth: false }),
   me: () => request("/api/me"),
   users: (search) => request(`/api/users?search=${encodeURIComponent(search || "")}`),
+
   rooms: () => request("/api/rooms"),
-  createRoom: (name) => request("/api/rooms", { method: "POST", body: { name } }),
+
+  createRoom: ({ name, visibility = "public", password = "" }) =>
+    request("/api/rooms", {
+      method: "POST",
+      body: {
+        name,
+        visibility,
+        password: visibility === "private" ? password : undefined,
+      },
+    }),
+
+  // Join a public room, or join a private room by passing {password}
+  joinRoom: (roomId, { password } = {}) =>
+    request(`/api/rooms/${roomId}/join`, { method: "POST", body: password ? { password } : undefined }),
+
+  leaveRoom: (roomId) => request(`/api/rooms/${roomId}/leave`, { method: "POST" }),
+  deleteRoom: (roomId) => request(`/api/rooms/${roomId}`, { method: "DELETE" }),
+
   dmRoom: (userId) => request("/api/rooms/dm", { method: "POST", body: { userId } }),
+
   messages: (roomId, { before, limit } = {}) => {
     const qs = new URLSearchParams();
     if (before) qs.set("before", before);
@@ -49,5 +68,7 @@ export const api = {
     const q = qs.toString();
     return request(`/api/rooms/${roomId}/messages${q ? `?${q}` : ""}`);
   },
+
   clearRoom: (roomId) => request(`/api/rooms/${roomId}/clear`, { method: "POST" }),
 };
+

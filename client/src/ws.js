@@ -1,51 +1,94 @@
+// client/src/ws.js
 export function createWsClient({ url, token, onEvent }) {
   let ws = null;
   let closedByUser = false;
   let retry = 0;
 
+  // Queue messages until WS is OPEN
+  const queue = [];
+  const MAX_QUEUE = 300;
+
+  function emit(evt) {
+    try {
+      onEvent?.(evt);
+    } catch (e) {
+      console.error("onEvent error:", e);
+    }
+  }
+
+  function buildUrl() {
+    const u = new URL(url);
+    if (token) u.searchParams.set("token", token);
+    return u.toString();
+  }
+
+  function flushQueue() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    while (queue.length) {
+      ws.send(queue.shift());
+    }
+  }
+
   function connect() {
-    const fullUrl = `${url}?token=${encodeURIComponent(token)}`;
-    ws = new WebSocket(fullUrl);
+    const wsUrl = buildUrl();
+    ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       retry = 0;
-      onEvent({ type: "__open" });
+      emit({ type: "__open" });
+      flushQueue();
     };
 
     ws.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
-        onEvent(data);
+        emit(data);
       } catch {
-        // ignore
+        // ignore non-JSON
       }
     };
 
     ws.onclose = () => {
-      onEvent({ type: "__close" });
-      if (closedByUser) return;
+      emit({ type: "__close" });
 
+      if (closedByUser) return;
       retry += 1;
-      const delay = Math.min(6000, 500 * retry);
+      const delay = Math.min(5000, 500 * retry);
       setTimeout(connect, delay);
     };
 
     ws.onerror = () => {
-      try { ws.close(); } catch {}
+      // onerror usually followed by close; ensure close happens
+      try {
+        ws.close();
+      } catch {}
     };
   }
 
   connect();
 
   return {
+    isOpen() {
+      return !!ws && ws.readyState === WebSocket.OPEN;
+    },
     send(obj) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-      ws.send(JSON.stringify(obj));
-      return true;
+      const payload = JSON.stringify(obj);
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+        return true;
+      }
+
+      // queue when not open
+      queue.push(payload);
+      if (queue.length > MAX_QUEUE) queue.shift(); // drop oldest
+      return false;
     },
     close() {
       closedByUser = true;
-      try { ws.close(); } catch {}
+      try {
+        ws?.close();
+      } catch {}
     },
   };
 }

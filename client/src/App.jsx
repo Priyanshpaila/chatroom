@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { api, clearToken, getToken, setToken } from "./api";
 import { createWsClient } from "./ws";
 
@@ -12,10 +12,20 @@ function fmtTime(ts) {
 
 function useToast() {
   const [toast, setToast] = useState(null);
-  function show(message, type = "info") {
+  const timerRef = useRef(null);
+
+  const show = useCallback((message, type = "info") => {
+    if (timerRef.current) clearTimeout(timerRef.current);
     setToast({ message, type });
-    setTimeout(() => setToast(null), 2500);
-  }
+    timerRef.current = setTimeout(() => setToast(null), 2500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
   return { toast, show };
 }
 
@@ -31,31 +41,76 @@ export default function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
-  // chat state
+  // rooms + chat state
   const [rooms, setRooms] = useState([]);
+  const [discoverRooms, setDiscoverRooms] = useState([]);
+
   const [activeRoomId, setActiveRoomId] = useState("");
+  const activeRoomIdRef = useRef("");
+  useEffect(() => {
+    activeRoomIdRef.current = activeRoomId;
+  }, [activeRoomId]);
+
   const [online, setOnline] = useState([]);
   const [typing, setTyping] = useState("");
 
   const [messages, setMessages] = useState([]);
   const [nextBefore, setNextBefore] = useState(null);
   const [loadingMore, setLoadingMore] = useState(false);
-
   const [msgText, setMsgText] = useState("");
 
   const sockRef = useRef(null);
   const bottomRef = useRef(null);
   const typingTimerRef = useRef(null);
 
-  // create room / dm
+  // create room
   const [newRoomName, setNewRoomName] = useState("");
+  const [newRoomVisibility, setNewRoomVisibility] = useState("public");
+  const [newRoomPassword, setNewRoomPassword] = useState("");
+
+  // join private
+  const [joinCode, setJoinCode] = useState("");
+  const [joinPass, setJoinPass] = useState("");
+
+  // DM
   const [userSearch, setUserSearch] = useState("");
   const [userResults, setUserResults] = useState([]);
+
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+  }, []);
+
+  // ---- rooms loader (stable) ----
+  const refreshRooms = useCallback(async () => {
+    const r = await api.rooms();
+    setRooms(r.rooms || []);
+    setDiscoverRooms(r.discover || []);
+
+    // Select first room if none selected
+    if (!activeRoomIdRef.current && r.rooms?.length) {
+      setActiveRoomId(r.rooms[0].id);
+    }
+  }, []);
+
+  // throttle room refreshes to avoid hammering the server on every message
+  const refreshTimerRef = useRef(null);
+  const requestRoomsRefresh = useCallback(() => {
+    if (refreshTimerRef.current) return;
+    refreshTimerRef.current = setTimeout(async () => {
+      refreshTimerRef.current = null;
+      try {
+        await refreshRooms();
+      } catch {
+        // ignore
+      }
+    }, 350);
+  }, [refreshRooms]);
 
   // boot: if token exists, load me
   useEffect(() => {
     if (!token) return;
-    api.me()
+    api
+      .me()
       .then((r) => setMe(r.user))
       .catch(() => {
         setMe(null);
@@ -67,20 +122,20 @@ export default function App() {
   // load rooms after me
   useEffect(() => {
     if (!me) return;
-    refreshRooms();
-  }, [me]);
+    refreshRooms().catch((e) => show(e.message || "Failed to load rooms", "error"));
+  }, [me, refreshRooms, show]);
 
-  async function refreshRooms() {
-    try {
-      const r = await api.rooms();
-      setRooms(r.rooms || []);
-      if (!activeRoomId && r.rooms?.length) setActiveRoomId(r.rooms[0].id);
-    } catch (e) {
-      show(e.message || "Failed to load rooms", "error");
+  // keep active room valid if you left/deleted
+  useEffect(() => {
+    if (!me) return;
+    if (!activeRoomId) return;
+    const exists = rooms.some((r) => r.id === activeRoomId);
+    if (!exists) {
+      setActiveRoomId(rooms[0]?.id || "");
     }
-  }
+  }, [rooms, activeRoomId, me]);
 
-  // connect WS when logged in
+  // ---- connect WS ONCE (per login) ----
   useEffect(() => {
     if (!me || !token) return;
 
@@ -90,30 +145,40 @@ export default function App() {
       url: WS_URL,
       token,
       onEvent: (evt) => {
-        if (evt.type === "__open") return;
-        if (evt.type === "__close") return;
+        const currentRoom = activeRoomIdRef.current;
+
+        if (evt.type === "__open") {
+          if (currentRoom) sock.send({ type: "join", roomId: currentRoom });
+          return;
+        }
+
+        if (evt.type === "__close") {
+          setOnline([]);
+          setTyping("");
+          return;
+        }
 
         if (evt.type === "ready") return;
 
         if (evt.type === "presence") {
-          if (evt.roomId === activeRoomId) setOnline(evt.online || []);
+          if (evt.roomId === currentRoom) setOnline(evt.online || []);
           return;
         }
 
         if (evt.type === "typing") {
-          if (evt.roomId !== activeRoomId) return;
+          if (evt.roomId !== currentRoom) return;
           setTyping(evt.isTyping ? `${evt.name} is typing...` : "");
           return;
         }
 
         if (evt.type === "message") {
-          if (evt.message?.roomId !== activeRoomId) {
-            // refresh rooms list to update last message
-            refreshRooms();
+          // If message is for another room, only update room list preview
+          if (evt.message?.roomId !== currentRoom) {
+            requestRoomsRefresh();
             return;
           }
           setMessages((p) => [...p, evt.message]);
-          refreshRooms();
+          requestRoomsRefresh();
           return;
         }
 
@@ -125,12 +190,10 @@ export default function App() {
     });
 
     sockRef.current = sock;
-
     return () => sock.close();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [me, token, activeRoomId]);
+  }, [me, token, requestRoomsRefresh, show]);
 
-  // join active room + load history
+  // ---- when active room changes: WS join + load history ----
   useEffect(() => {
     if (!me || !activeRoomId) return;
 
@@ -139,25 +202,22 @@ export default function App() {
     setOnline([]);
     setTyping("");
 
+    // join over WS
     sockRef.current?.send({ type: "join", roomId: activeRoomId });
 
-    api.messages(activeRoomId, { limit: 50 })
+    api
+      .messages(activeRoomId, { limit: 50 })
       .then((r) => {
         setMessages(r.messages || []);
         setNextBefore(r.nextBefore || null);
         scrollToBottom();
       })
       .catch((e) => show(e.message || "Failed to load messages", "error"));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeRoomId, me]);
-
-  function scrollToBottom() {
-    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
-  }
+  }, [activeRoomId, me, scrollToBottom, show]);
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, typing]);
+  }, [messages, typing, scrollToBottom]);
 
   async function loadMore() {
     if (!activeRoomId || !nextBefore || loadingMore) return;
@@ -203,16 +263,23 @@ export default function App() {
     setTok("");
     setMe(null);
     setRooms([]);
+    setDiscoverRooms([]);
     setActiveRoomId("");
     setMessages([]);
+    setOnline([]);
+    setTyping("");
+    sockRef.current?.close();
+    sockRef.current = null;
   }
 
   function onTypingChange(v) {
     setMsgText(v);
-    sockRef.current?.send({ type: "typing", isTyping: true });
+    if (!activeRoomId) return;
+
+    sockRef.current?.send({ type: "typing", roomId: activeRoomId, isTyping: true });
     clearTimeout(typingTimerRef.current);
     typingTimerRef.current = setTimeout(() => {
-      sockRef.current?.send({ type: "typing", isTyping: false });
+      sockRef.current?.send({ type: "typing", roomId: activeRoomId, isTyping: false });
     }, 600);
   }
 
@@ -220,22 +287,98 @@ export default function App() {
     e.preventDefault();
     const t = msgText.trim();
     if (!t) return;
-    sockRef.current?.send({ type: "send", text: t });
+
+    if (!activeRoomId) {
+      show("Select a room first", "error");
+      return;
+    }
+
+    sockRef.current?.send({ type: "send", roomId: activeRoomId, text: t });
     setMsgText("");
-    sockRef.current?.send({ type: "typing", isTyping: false });
+    sockRef.current?.send({ type: "typing", roomId: activeRoomId, isTyping: false });
   }
 
   async function createRoom() {
     const n = newRoomName.trim();
     if (n.length < 2) return show("Room name min 2 chars", "error");
+    if (newRoomVisibility === "private" && newRoomPassword.trim().length < 4) {
+      return show("Private room password min 4 chars", "error");
+    }
     try {
-      const r = await api.createRoom(n);
+      const r = await api.createRoom({ name: n, visibility: newRoomVisibility, password: newRoomPassword });
       setNewRoomName("");
+      setNewRoomPassword("");
       await refreshRooms();
       setActiveRoomId(r.room.id);
-      show("Room created", "ok");
+      if (newRoomVisibility === "private") {
+        show(`Private room created. Share code: ${r.room.id}`, "ok");
+      } else {
+        show("Room created", "ok");
+      }
     } catch (e) {
       show(e.message || "Failed to create room", "error");
+    }
+  }
+
+  async function joinPublicRoom(roomId) {
+    try {
+      await api.joinRoom(roomId);
+      await refreshRooms();
+      setActiveRoomId(roomId);
+      show("Joined room", "ok");
+    } catch (e) {
+      show(e.message || "Failed to join room", "error");
+    }
+  }
+
+  async function joinPrivateRoom() {
+    const code = joinCode.trim();
+    const pass = joinPass.trim();
+    if (!code) return show("Enter room code", "error");
+    if (pass.length < 4) return show("Enter room password", "error");
+    try {
+      await api.joinRoom(code, { password: pass });
+      setJoinCode("");
+      setJoinPass("");
+      await refreshRooms();
+      setActiveRoomId(code);
+      show("Joined private room", "ok");
+    } catch (e) {
+      show(e.message || "Failed to join private room", "error");
+    }
+  }
+
+  async function leaveActiveRoom() {
+    if (!activeRoomId) return;
+    try {
+      await api.leaveRoom(activeRoomId);
+      await refreshRooms();
+      show("Left room", "ok");
+    } catch (e) {
+      show(e.message || "Failed to leave room", "error");
+    }
+  }
+
+  async function deleteActiveRoom() {
+    if (!activeRoomId) return;
+    try {
+      await api.deleteRoom(activeRoomId);
+      await refreshRooms();
+      show("Room deleted", "ok");
+    } catch (e) {
+      show(e.message || "Failed to delete room", "error");
+    }
+  }
+
+  async function clearChat() {
+    if (!activeRoomId) return;
+    try {
+      await api.clearRoom(activeRoomId);
+      setMessages([]);
+      setNextBefore(null);
+      show("Chat cleared (for you)", "ok");
+    } catch (e) {
+      show(e.message || "Failed to clear chat", "error");
     }
   }
 
@@ -263,19 +406,9 @@ export default function App() {
     }
   }
 
-  async function clearChat() {
-    if (!activeRoomId) return;
-    try {
-      await api.clearRoom(activeRoomId);
-      setMessages([]);
-      setNextBefore(null);
-      show("Chat cleared (for you)", "ok");
-    } catch (e) {
-      show(e.message || "Failed to clear chat", "error");
-    }
-  }
-
   const activeRoom = useMemo(() => rooms.find((r) => r.id === activeRoomId) || null, [rooms, activeRoomId]);
+  const canDelete = activeRoom?.type === "group" && activeRoom?.role === "owner";
+  const canLeave = !!activeRoomId && (!canDelete || activeRoom?.type !== "group");
 
   if (!token || !me) {
     return (
@@ -285,7 +418,7 @@ export default function App() {
             <div className="logoDot" />
             <div>
               <div className="brandTitle">Chat WS Pro</div>
-              <div className="brandSub">Secure rooms + DMs + persistence</div>
+              <div className="brandSub">Rooms + DMs + history + private rooms</div>
             </div>
           </div>
 
@@ -293,7 +426,10 @@ export default function App() {
             <button className={authMode === "login" ? "tab active" : "tab"} onClick={() => setAuthMode("login")}>
               Login
             </button>
-            <button className={authMode === "register" ? "tab active" : "tab"} onClick={() => setAuthMode("register")}>
+            <button
+              className={authMode === "register" ? "tab active" : "tab"}
+              onClick={() => setAuthMode("register")}
+            >
               Register
             </button>
           </div>
@@ -345,8 +481,15 @@ export default function App() {
           </div>
         </div>
         <div className="right">
-          <button className="ghostBtn" onClick={refreshRooms}>Refresh</button>
-          <button className="dangerBtn" onClick={logout}>Logout</button>
+          <button
+            className="ghostBtn"
+            onClick={() => refreshRooms().catch((e) => show(e.message || "Refresh failed", "error"))}
+          >
+            Refresh
+          </button>
+          <button className="dangerBtn" onClick={logout}>
+            Logout
+          </button>
         </div>
       </header>
 
@@ -357,6 +500,40 @@ export default function App() {
             <div className="row">
               <input value={newRoomName} onChange={(e) => setNewRoomName(e.target.value)} placeholder="e.g. Team" />
               <button onClick={createRoom}>Create</button>
+            </div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <select value={newRoomVisibility} onChange={(e) => setNewRoomVisibility(e.target.value)}>
+                <option value="public">Public</option>
+                <option value="private">Private (password)</option>
+              </select>
+              {newRoomVisibility === "private" ? (
+                <input
+                  value={newRoomPassword}
+                  onChange={(e) => setNewRoomPassword(e.target.value)}
+                  placeholder="Room password"
+                  type="password"
+                />
+              ) : (
+                <div className="muted" style={{ padding: "10px 0" }}>
+                  Visible in Discover
+                </div>
+              )}
+            </div>
+            {newRoomVisibility === "private" ? (
+              <div className="muted" style={{ marginTop: 6 }}>
+                Share room <b>code</b> (room ID) + password to invite.
+              </div>
+            ) : null}
+          </div>
+
+          <div className="section">
+            <div className="sectionTitle">Join private room</div>
+            <div className="row">
+              <input value={joinCode} onChange={(e) => setJoinCode(e.target.value)} placeholder="Room code (ID)" />
+              <button onClick={joinPrivateRoom}>Join</button>
+            </div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <input value={joinPass} onChange={(e) => setJoinPass(e.target.value)} placeholder="Password" type="password" />
             </div>
           </div>
 
@@ -389,12 +566,17 @@ export default function App() {
                 >
                   <div className="roomTop">
                     <span className="roomTitle">{r.title}</span>
-                    <span className="roomType">{r.type.toUpperCase()}</span>
+                    <span className="roomType">
+                      {r.type.toUpperCase()}
+                      {r.type === "group" && r.visibility === "private" ? " • PRIVATE" : ""}
+                    </span>
                   </div>
                   <div className="roomSub">
                     {r.lastMessage ? (
                       <>
-                        <span className="roomLast">{r.lastMessage.senderName}: {r.lastMessage.text}</span>
+                        <span className="roomLast">
+                          {r.lastMessage.senderName}: {r.lastMessage.text}
+                        </span>
                         <span className="roomTime">{fmtTime(r.lastMessage.createdAt)}</span>
                       </>
                     ) : (
@@ -403,9 +585,31 @@ export default function App() {
                   </div>
                 </button>
               ))}
-              {!rooms.length ? <div className="muted">No rooms. Create one or start a DM.</div> : null}
+              {!rooms.length ? <div className="muted">No rooms yet. Create one or start a DM.</div> : null}
             </div>
           </div>
+
+          {discoverRooms.length ? (
+            <div className="section">
+              <div className="sectionTitle">Discover rooms (public)</div>
+              <div className="roomList">
+                {discoverRooms.map((r) => (
+                  <div key={r.id} className="roomItem">
+                    <div className="roomTop">
+                      <span className="roomTitle">{r.title}</span>
+                      <span className="roomType">PUBLIC</span>
+                    </div>
+                    <div className="roomSub">
+                      <span className="roomMuted">Not joined</span>
+                      <button className="ghostBtn" onClick={() => joinPublicRoom(r.id)}>
+                        Join
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </aside>
 
         <main className="chat">
@@ -413,13 +617,29 @@ export default function App() {
             <div>
               <div className="chatTitle">{activeRoom?.title || "Select a room"}</div>
               <div className="chatMeta">
-                Online: <b>{online.length}</b> {typing ? <span className="typing">{typing}</span> : null}
+                Online: <b>{online.length}</b>
+                {typing ? <span className="typing">{typing}</span> : null}
+                {activeRoom?.type === "group" && activeRoom?.code ? (
+                  <span className="metaChip">
+                    Code: <code>{activeRoom.code}</code>
+                  </span>
+                ) : null}
               </div>
             </div>
             <div className="chatActions">
               <button className="ghostBtn" onClick={loadMore} disabled={!nextBefore || loadingMore}>
                 {loadingMore ? "Loading..." : nextBefore ? "Load older" : "No more"}
               </button>
+              {canLeave ? (
+                <button className="ghostBtn" onClick={leaveActiveRoom} disabled={!activeRoomId}>
+                  Leave
+                </button>
+              ) : null}
+              {canDelete ? (
+                <button className="dangerBtn" onClick={deleteActiveRoom} disabled={!activeRoomId}>
+                  Delete
+                </button>
+              ) : null}
               <button className="dangerBtn" onClick={clearChat} disabled={!activeRoomId}>
                 Clear chat
               </button>

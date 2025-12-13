@@ -19,6 +19,15 @@ import { roomsRouter } from "./routes/rooms.js";
 
 import { RoomMember } from "./models/RoomMember.js";
 import { Message } from "./models/Message.js";
+import { Room } from "./models/Room.js";
+
+function oid(id) {
+  try {
+    return new mongoose.Types.ObjectId(id);
+  } catch {
+    return null;
+  }
+}
 
 const PORT = Number(process.env.PORT || 4000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
@@ -75,50 +84,76 @@ wss.on("connection", async (ws, req) => {
       return sendJson(ws, { type: TYPES.ERROR, message: "Invalid JSON" });
     }
 
+    async function ensureMember(roomId) {
+      const roomObjId = oid(roomId);
+      const meObjId = oid(user.id);
+      if (!roomObjId || !meObjId) return { ok: false, error: "Invalid room id" };
+
+      const room = await Room.findById(roomObjId).select("type visibility").lean();
+      if (!room) return { ok: false, error: "Room not found" };
+
+      const exists = await RoomMember.exists({ roomId: roomObjId, userId: meObjId });
+      if (exists) return { ok: true, room, roomId: String(roomObjId) };
+
+      // UX: allow auto-joining public group rooms (discover list / direct join)
+      const isPublicGroup =
+        room.type === "group" && (room.visibility === "public" || room.visibility === undefined);
+      if (!isPublicGroup) {
+        return {
+          ok: false,
+          error:
+            room.type === "group" && room.visibility === "private"
+              ? "Room is private. Join with password first."
+              : "Not a member of this room",
+        };
+      }
+
+      await RoomMember.updateOne(
+        { roomId: roomObjId, userId: meObjId },
+        { $setOnInsert: { roomId: roomObjId, userId: meObjId, role: "member" } },
+        { upsert: true }
+      );
+      return { ok: true, room, roomId: String(roomObjId) };
+    }
+
     try {
       if (msg.type === TYPES.JOIN) {
         const roomId = String(msg.roomId || "").trim();
         if (!roomId) return sendJson(ws, { type: TYPES.ERROR, message: "roomId required" });
 
-        // membership check
-        const isMember = await RoomMember.exists({
-          roomId: new mongoose.Types.ObjectId(roomId),
-          userId: new mongoose.Types.ObjectId(user.id),
-        });
+        const check = await ensureMember(roomId);
+        if (!check.ok) return sendJson(ws, { type: TYPES.ERROR, message: check.error });
 
-        if (!isMember) return sendJson(ws, { type: TYPES.ERROR, message: "Not a member of this room" });
-
-        joinRoomSocket(ws, roomId);
+        joinRoomSocket(ws, check.roomId);
         return;
       }
 
       if (msg.type === TYPES.SEND) {
-        const roomId = ws._roomId;
+        const roomId = String(msg.roomId || ws._roomId || "").trim();
         if (!roomId) return sendJson(ws, { type: TYPES.ERROR, message: "Join a room first" });
 
         const text = String(msg.text || "").trim();
         if (!text) return;
         if (text.length > 2000) return sendJson(ws, { type: TYPES.ERROR, message: "Message too long" });
 
-        // Ensure membership still valid
-        const isMember = await RoomMember.exists({
-          roomId: new mongoose.Types.ObjectId(roomId),
-          userId: new mongoose.Types.ObjectId(user.id),
-        });
-        if (!isMember) return sendJson(ws, { type: TYPES.ERROR, message: "Not a member of this room" });
+        const check = await ensureMember(roomId);
+        if (!check.ok) return sendJson(ws, { type: TYPES.ERROR, message: check.error });
+
+        // ensure ws is in the room for presence updates
+        if (ws._roomId !== check.roomId) joinRoomSocket(ws, check.roomId);
 
         const created = await Message.create({
-          roomId: new mongoose.Types.ObjectId(roomId),
-          senderId: new mongoose.Types.ObjectId(user.id),
+          roomId: oid(check.roomId),
+          senderId: oid(user.id),
           senderName: user.name,
           text,
         });
 
-        broadcastToRoom(roomId, {
+        broadcastToRoom(check.roomId, {
           type: TYPES.MESSAGE,
           message: {
             id: String(created._id),
-            roomId,
+            roomId: check.roomId,
             senderId: String(created.senderId),
             senderName: created.senderName,
             text: created.text,
@@ -129,11 +164,14 @@ wss.on("connection", async (ws, req) => {
       }
 
       if (msg.type === TYPES.TYPING) {
-        const roomId = ws._roomId;
+        const roomId = String(msg.roomId || ws._roomId || "").trim();
         if (!roomId) return;
+        const check = await ensureMember(roomId);
+        if (!check.ok) return;
+        if (ws._roomId !== check.roomId) joinRoomSocket(ws, check.roomId);
         broadcastToRoom(
-          roomId,
-          { type: TYPES.TYPING, roomId, name: user.name, isTyping: !!msg.isTyping },
+          check.roomId,
+          { type: TYPES.TYPING, roomId: check.roomId, name: user.name, isTyping: !!msg.isTyping },
           { excludeWs: ws }
         );
         return;
